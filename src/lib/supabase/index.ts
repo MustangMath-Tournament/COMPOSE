@@ -4,3 +4,5 @@ export * from "./testsolve";
 export * from "./tournaments";
 export * from "./users";
 export * from "./images";
+export * from "./guts";
+export * from "./grading";

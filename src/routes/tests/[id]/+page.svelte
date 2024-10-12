@@ -5,23 +5,30 @@
 	import { Loading, Checkbox } from "carbon-components-svelte";
 	import toast from "svelte-french-toast";
 	import { handleError } from "$lib/handleError";
+	import { downloadBlob } from "$lib/utils/download";
 	import {
-		getImages,
 		getTestInfo,
 		getTestProblems,
 		getThisUser,
 		getThisUserRole,
+		upsertTestAnswerBoxes,
 	} from "$lib/supabase";
-	import QRCode from "qrcode";
 	import compilerPath from "@myriaddreamin/typst-ts-web-compiler/pkg/typst_ts_web_compiler_bg.wasm?url";
 	import rendererPath from "@myriaddreamin/typst-ts-renderer/pkg/typst_ts_renderer_bg.wasm?url";
 	import { $typst as Typst } from "@myriaddreamin/typst.ts/dist/esm/contrib/snippet.mjs";
 	import { ImageBucket } from "$lib/ImageBucket";
 	import type { ProblemImage } from "$lib/getProblemImages";
-	import answerSheet from "./answer_sheet.typ?url";
+	import testSheet from "./test_sheet.typ?url";
+	import gutsSheet from "./guts.typ?url";
+	import tiebreakerSheet from "./tiebreaker.typ?url";
+	import * as scheme from "$lib/scheme.json";
 
-	Typst.setRendererInitOptions({ getModule: () => rendererPath });
-	Typst.setCompilerInitOptions({ getModule: () => compilerPath });
+	try {
+		Typst.setRendererInitOptions({ getModule: () => rendererPath });
+		Typst.setCompilerInitOptions({ getModule: () => compilerPath });
+	} catch (e) {
+		console.error("compiler may have been initialized", e);
+	}
 
 	let testId = Number($page.params.id);
 	let test;
@@ -41,6 +48,7 @@
 		"Solutions",
 		"Comments",
 		"Feedback",
+		"Standard Layout",
 	];
 	let selected_values = values.slice(0, 1);
 
@@ -84,54 +92,86 @@
 		e.target.innerText = "Processing";
 
 		try {
-			const generateQR = async (text: string) => {
-				return await QRCode.toString(text, { type: "svg" });
-			};
-			const answer_template_body = await fetch(answerSheet).then((r) =>
-				r.text()
-			);
+			const is_selected = (option) =>
+				selected_values.find((o) => o == option) != undefined;
+			let template_source = testSheet;
+			// TODO: consolidate guts, tiebreakers, and standard typst document layouts.
+			if (
+				test.test_name == "Guts"
+				&& !is_selected("Answers")
+				&& !is_selected("Solutions")
+				&& !is_selected("Standard Layout")
+			) {
+				template_source = gutsSheet;
+			} else if (
+				test.test_name.indexOf("Tiebreaker") != -1 
+			  && !is_selected("Answers") 
+			  && !is_selected("Solutions")
+				&& !is_selected("Standard Layout")
+			) {
+				template_source = tiebreakerSheet;
+			}
+			const answer_template_body = await fetch(template_source ).then((r) => r.text());
+
+			// TODO: @tweoss (francis) get rid of this hack of using test name directly
+			if (test.test_name == "Integration Bee") {
+				// Sort by ascending difficulty.
+				// TODO: why is this using average_difficulty not difficulty?
+				problems = problems.sort(
+					(a, b) => a.average_difficulty - b.average_difficulty
+				);
+				console.log("sorting by difficulty", problems);
+			}
 
 			let utf8Encode = new TextEncoder();
 			let [year, month, day] = test.tournaments.tournament_date
 				.split("-")
 				.map((n) => parseInt(n));
-			const is_selected = (option) => selected_values.find(o => o == option) != undefined;
 			const test_metadata = JSON.stringify({
 				name: test.test_name,
 				id: "T" + test.id,
 				day,
 				month,
 				year,
-				team_test: false, // TODO: label tests in database as team or individual
+				team_test: test.is_team, // TODO: label tests in database as team or individual
 				display: {
 					answers: is_selected("Answers"),
 					solutions: is_selected("Solutions"),
-				}
+				},
 			});
+			const test_logo = await fetch(scheme.test_logo).then((r) =>
+				r.arrayBuffer()
+			);
 
-			Typst.mapShadow(
-				"/assets/test_metadata.json",
-				utf8Encode.encode(test_metadata)
-			);
-			Typst.mapShadow(
-				"/assets/problems.json",
-				utf8Encode.encode(JSON.stringify(problems))
-			);
-			Typst.mapShadow(
-				"/answer_sheet_compiling.toml",
-				utf8Encode.encode("[config]\nlocal = false")
-			);
-			Typst.mapShadow(
-				"/main.typ",
-				utf8Encode.encode(answer_template_body)
-			);
+			await Typst.resetShadow();
+			await Promise.all([
+				Typst.mapShadow(
+					"/assets/test_metadata.json",
+					utf8Encode.encode(test_metadata)
+				),
+				Typst.mapShadow("/assets/test_logo.png", new Uint8Array(test_logo)),
+				Typst.mapShadow(
+					"/assets/problems.json",
+					utf8Encode.encode(JSON.stringify(problems))
+				),
+				Typst.mapShadow(
+					"/answer_sheet_compiling.toml",
+					utf8Encode.encode("[config]\nlocal = false")
+				),
+				Typst.mapShadow("/main.typ", utf8Encode.encode(answer_template_body)),
+			]);
+			console.log("test metadata", test_metadata);
 
 			let { images, errorList }: { images: ProblemImage[]; errorList: any[] } =
 				(
 					await Promise.all(
-						problems.map((p) =>
-							ImageBucket.downloadLatexImages(p.problem_latex)
-						)
+						problems
+							.flatMap((p) => [
+								p.solution_latex,
+								p.problem_latex,
+								p.answer_latex,
+							])
+							.map((latex: string) => ImageBucket.downloadLatexImages(latex))
 					)
 				).reduce((a, e) => {
 					a.errorList = a.errorList.concat(e.errorList);
@@ -142,39 +182,42 @@
 				throw errorList;
 			}
 
-			for (const image of images) {
-				Typst.mapShadow(
-					"/problem_images" + image.name,
-					new Uint8Array(await image.blob.arrayBuffer())
-				);
-			}
+			await Promise.all(
+				images.map(async (image) => {
+					return await Typst.mapShadow(
+						"/problem_images" + image.name,
+						new Uint8Array(await image.blob.arrayBuffer())
+					);
+				})
+			);
+			console.log(images);
 
-			const downloadURL = (data, fileName) => {
-				const a = document.createElement("a");
-				a.href = data;
-				a.download = fileName;
-				document.body.appendChild(a);
-				a.style.display = "none";
-				a.click();
-				a.remove();
-			};
-			const downloadBlob = (data, fileName, mimeType) => {
-				const url = window.URL.createObjectURL(
-					new Blob([data], {
-						type: mimeType,
-					})
-				);
-				downloadURL(url, fileName);
-				setTimeout(() => window.URL.revokeObjectURL(url), 1000);
-			};
+			await new Promise((r) => setTimeout(() => r(1), 1000));
+			const pdf_array = await Typst.pdf({ mainFilePath: "/main.typ" });
+			downloadBlob(pdf_array, test.test_name + ".pdf", "application/pdf");
 
-			Typst.pdf({ mainFilePath: "/main.typ" }).then((array) => {
-				downloadBlob(array, test.test_name + ".pdf", "application/pdf");
-			});
-
-			(await Typst.getCompiler()).query({mainFilePath: "/main.typ", selector: "<box_positions>", field: "value"}).then((box_positions) => {
-				downloadBlob(JSON.stringify(box_positions[0]), "box_positions.json", "application/json");
-			});
+			Typst.getCompiler()
+				.then(
+					async (compiler) =>
+						await Promise.all(
+							["<box_positions>", "<header_lines>"].map((selector) =>
+								compiler.query({
+									mainFilePath: "/main.typ",
+									selector,
+									field: "value",
+								})
+							)
+						)
+				)
+				.then(([box_positions, header_lines]) => {
+					upsertTestAnswerBoxes(
+						test.id,
+						JSON.stringify({
+							box_positions: box_positions[0],
+							header_lines: header_lines[0],
+						})
+					);
+				});
 		} catch (error) {
 			handleError(error);
 			toast.error(error.message);
